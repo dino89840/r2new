@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>R2 Dual Uploader</title>
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>☁️ R2 Dual Uploader</h1>
+      <p class="subtitle">Upload to 2 R2 accounts simultaneously — Fast & Streamed</p>
+    </header>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="file">📁 File Upload</button>
+      <button class="tab" data-tab="url">🔗 URL Upload</button>
+      <button class="tab" data-tab="history">📋 History</button>
+    </div>
+
+    <!-- File Upload Tab -->
+    <div class="tab-content active" id="tab-file">
+      <div class="upload-zone" id="dropZone">
+        <div class="upload-icon">📂</div>
+        <p>Drag & Drop your file here</p>
+        <p class="small">or click to browse</p>
+        <input type="file" id="fileInput" hidden />
+      </div>
+      <div class="progress-area" id="fileProgressArea" style="display:none;">
+        <div class="file-info" id="fileInfo"></div>
+        <div class="progress-bar-wrapper">
+          <div class="progress-bar">
+            <div class="progress-fill" id="fileProgressFill"></div>
+          </div>
+          <span class="progress-text" id="fileProgressText">0%</span>
+        </div>
+        <div class="speed-info" id="fileSpeedInfo"></div>
+        <div class="upload-status" id="fileUploadStatus"></div>
+      </div>
+    </div>
+
+    <!-- URL Upload Tab -->
+    <div class="tab-content" id="tab-url">
+      <div class="url-input-group">
+        <input type="url" id="remoteUrl" placeholder="Paste direct download link here..." autocomplete="off" />
+        <button id="urlUploadBtn" class="btn-primary">Upload</button>
+      </div>
+      <div class="progress-area" id="urlProgressArea" style="display:none;">
+        <div class="file-info" id="urlFileInfo"></div>
+        <div class="phase-badge" id="urlPhaseBadge"></div>
+        <div class="progress-bar-wrapper">
+          <div class="progress-bar">
+            <div class="progress-fill" id="urlProgressFill"></div>
+          </div>
+          <span class="progress-text" id="urlProgressText">0%</span>
+        </div>
+        <div class="speed-info" id="urlSpeedInfo"></div>
+      </div>
+    </div>
+
+    <!-- History Tab -->
+    <div class="tab-content" id="tab-history">
+      <div class="history-actions">
+        <button id="clearHistoryBtn" class="btn-danger">🗑️ Clear All</button>
+      </div>
+      <div id="historyList" class="history-list"></div>
+      <p class="empty-state" id="emptyHistory">No uploads yet.</p>
+    </div>
+
+    <!-- Result Area -->
+    <div class="result-area" id="resultArea" style="display:none;">
+      <h3>✅ Upload Complete!</h3>
+      <div class="result-meta">
+        <span class="result-filename" id="resultFilename"></span>
+        <span class="result-size" id="resultSize"></span>
+      </div>
+      <div class="result-accounts" id="resultAccounts"></div>
+      <div class="links-container" id="linksContainer"></div>
+      <button class="btn-copy-all" id="copyAllBtn">📋 Copy All Links</button>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
