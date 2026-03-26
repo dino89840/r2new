@@ -32,8 +32,8 @@ const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
 };
 
 // ============ Tuning Config ============
-const MULTIPART_THRESHOLD = 10 * 1024 * 1024;    // 8MB — below this, simple PUT
-const PART_SIZE = 10 * 1024 * 1024;              // 10MB per part
+const MULTIPART_THRESHOLD = 40 * 1024 * 1024;    // 8MB — below this, simple PUT
+const PART_SIZE = 40 * 1024 * 1024;              // 10MB per part
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 2000;
 const INTER_PART_DELAY_MS = 50;
@@ -962,6 +962,7 @@ export async function handleRemoteUpload(
     uploadedTo: successes,
   };
 }
+
 
 
 
