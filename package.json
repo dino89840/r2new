@@ -1,0 +1,15 @@
+{
+  "name": "r2-dual-uploader",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler pages dev public --compatibility-date=2024-12-01 --compatibility-flags=nodejs_compat",
+    "deploy": "wrangler pages deploy public",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "wrangler": "^3.99.0",
+    "typescript": "^5.7.0"
+  }
+}
