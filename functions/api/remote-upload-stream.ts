@@ -27,7 +27,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       }
     };
 
-    // Heartbeat — connection timeout မဖြစ်အောင် 5 စက္ကန့်တိုင်း SSE comment ပို့ပေးတယ်
+    // Heartbeat every 5s to keep connection alive
     const heartbeatInterval = setInterval(async () => {
       if (streamClosed) {
         clearInterval(heartbeatInterval);
@@ -41,13 +41,8 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       }
     }, 5000);
 
-    // Upload logic ကို stream အတွင်းမှာပဲ run တယ်
-    // waitUntil ထဲထည့်တာက stream ကို alive ဖြစ်စေတာ မဟုတ်ဘူး
-    // ဒါကြောင့် upload ပြီးမှ stream ပိတ်အောင် ဒီ async block ကိုပဲ waitUntil ထဲထည့်ပြီး
-    // readable stream ကို return လုပ်တယ်
     const uploadAndStream = async () => {
       try {
-        // Upload မစခင် initial event ပို့ပေးတယ်
         await sendSSE({ type: "start", message: "Upload starting..." });
 
         const result = await handleRemoteUpload(
@@ -83,7 +78,6 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       }
     };
 
-    // waitUntil က worker ကို upload မပြီးခင် kill မလုပ်အောင် ကာကွယ်ပေးတယ်
     context.waitUntil(uploadAndStream());
 
     return new Response(readable, {
@@ -92,7 +86,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no", // Nginx/proxy buffering ပိတ်
+        "X-Accel-Buffering": "no",
       },
     });
   } catch (err) {
