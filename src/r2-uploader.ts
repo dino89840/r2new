@@ -32,8 +32,8 @@ const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
 };
 
 // ============ Tuning Config ============
-const MULTIPART_THRESHOLD = 20 * 1024 * 1024;    // 8MB — below this, simple PUT
-const PART_SIZE = 16 * 1024 * 1024;              // 16MB per part
+const MULTIPART_THRESHOLD = 10 * 1024 * 1024;    // 8MB — below this, simple PUT
+const PART_SIZE = 15 * 1024 * 1024;              // 15MB per part
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 2000;
 const INTER_PART_DELAY_MS = 50;
