@@ -30,8 +30,8 @@ const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
 };
 
 // ============ Tuning Config ============
-const MULTIPART_THRESHOLD = 10 * 1024 * 1024;    // 10MB - below this, simple PUT
-const PART_SIZE = 10 * 1024 * 1024;              // 10MB per part (S3 minimum is 5MB)
+const MULTIPART_THRESHOLD = 10 * 1024 * 1024;    // 10MB
+const PART_SIZE = 10 * 1024 * 1024;              // 10MB per part
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 2000;
 const INTER_PART_DELAY_MS = 50;
@@ -89,23 +89,10 @@ function getExtension(filename: string, contentType?: string): string {
     "video/x-flv": ".flv",
     "audio/mpeg": ".mp3",
     "audio/mp4": ".m4a",
-    "audio/ogg": ".ogg",
-    "audio/wav": ".wav",
-    "audio/flac": ".flac",
     "image/jpeg": ".jpg",
     "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/svg+xml": ".svg",
     "application/pdf": ".pdf",
     "application/zip": ".zip",
-    "application/x-rar-compressed": ".rar",
-    "application/x-7z-compressed": ".7z",
-    "application/gzip": ".gz",
-    "application/json": ".json",
-    "text/plain": ".txt",
-    "text/html": ".html",
-    "application/octet-stream": ".bin",
   };
 
   if (contentType) {
@@ -131,7 +118,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ============ AWS Signature V4 (Web Crypto API) ============
+// ============ AWS Signature V4 ============
 
 async function hmacSHA256(key: ArrayBuffer | Uint8Array, message: string): Promise<ArrayBuffer> {
   const cryptoKey = await crypto.subtle.importKey(
@@ -152,8 +139,6 @@ async function getSignatureKey(key: string, dateStamp: string, region: string, s
   const kService = await hmacSHA256(kRegion, service);
   return await hmacSHA256(kService, "aws4_request");
 }
-
-// ============ Signed Request Builder ============
 
 async function buildSignedHeaders(
   account: R2Account, method: string, objectKey: string, queryString: string,
@@ -191,8 +176,6 @@ async function buildSignedHeaders(
     headers: { ...allHeaders, Authorization: authorization },
   };
 }
-
-// ============ Retry wrapper ============
 
 async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -241,17 +224,23 @@ async function uploadPart(account: R2Account, objectKey: string, uploadId: strin
     if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
     const etag = res.headers.get("etag") || "";
     await res.body?.cancel();
-    return etag;
+    
+    // ETag ကို အမြဲတမ်း Double Quotes နဲ့ သေချာဖြစ်အောင် ပြင်ဆင်ခြင်း
+    const cleanEtag = etag.replace(/"/g, "");
+    return `"${cleanEtag}"`;
   });
 }
 
 async function completeMultipart(account: R2Account, objectKey: string, uploadId: string, parts: { partNumber: number; etag: string }[]): Promise<void> {
   await withRetry(`${account.label} CompleteMultipart`, async () => {
     const xmlParts = parts.map((p) => `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${p.etag}</ETag></Part>`).join("");
-    const bodyBytes = new TextEncoder().encode(`<CompleteMultipartUpload>${xmlParts}</CompleteMultipartUpload>`);
+    // S3 Standard xmlns ထည့်သွင်းထားသည်
+    const bodyStr = `<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${xmlParts}</CompleteMultipartUpload>`;
+    const bodyBytes = new TextEncoder().encode(bodyStr);
+    
     const { url, headers } = await buildSignedHeaders(account, "POST", objectKey, `uploadId=${encodeURIComponent(uploadId)}`, { "content-length": bodyBytes.byteLength.toString(), "content-type": "application/xml" }, await sha256(bodyBytes));
     const res = await fetch(url, { method: "POST", headers, body: bodyBytes });
-    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    if (!res.ok) throw new Error(`Status: ${res.status}, Response: ${await res.text()}`);
     await res.body?.cancel();
   });
 }
@@ -343,9 +332,14 @@ export async function handleRemoteUpload(
 
   let remoteContentType = "application/octet-stream";
   let contentLength = 0;
+  
+  // User Agent ထည့်သွင်းထားသည်
+  const fetchHeaders = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  };
 
   try {
-    const probeRes = await fetch(remoteUrl, { method: "HEAD", redirect: "follow" });
+    const probeRes = await fetch(remoteUrl, { method: "HEAD", headers: fetchHeaders, redirect: "follow" });
     remoteContentType = probeRes.headers.get("content-type") || remoteContentType;
     contentLength = parseInt(probeRes.headers.get("content-length") || "0", 10);
     await probeRes.body?.cancel();
@@ -355,23 +349,24 @@ export async function handleRemoteUpload(
 
   const uniqueName = generateUniqueFilename(getExtension(new URL(remoteUrl).pathname || "file", remoteContentType));
 
-  const dlRes = await fetch(remoteUrl, { redirect: "follow" });
+  const dlRes = await fetch(remoteUrl, { headers: fetchHeaders, redirect: "follow" });
   if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`);
 
   if (contentLength > 0 && contentLength <= MULTIPART_THRESHOLD) {
     const buffer = new Uint8Array(await dlRes.arrayBuffer());
     const successes: string[] = [];
+    const directErrors: string[] = [];
     
     await Promise.all(accounts.map(async (account) => {
       try {
         await uploadSimplePut(account, uniqueName, buffer, remoteContentType);
         successes.push(account.label);
       } catch (e) {
-        console.error(`[${account.label}] Failed: ${(e as Error).message}`);
+        directErrors.push(`[${account.label}] ${(e as Error).message}`);
       }
     }));
     
-    if (successes.length === 0) throw new Error("All uploads failed");
+    if (successes.length === 0) throw new Error(`All simple uploads failed: ${directErrors.join(", ")}`);
     return { filename: uniqueName, size: buffer.byteLength, links: buildDownloadLinks(uniqueName, accounts), uploadedTo: successes };
   }
 
@@ -380,9 +375,9 @@ export async function handleRemoteUpload(
     accounts.map(async (acc) => {
       try {
         const uploadId = await initiateMultipart(acc, uniqueName, remoteContentType);
-        return { account: acc, uploadId, parts: [] as { partNumber: number; etag: string }[], failed: false };
+        return { account: acc, uploadId, parts: [] as { partNumber: number; etag: string }[], failed: false, errorMsg: "" };
       } catch (e) {
-        return { account: acc, uploadId: "", parts: [], failed: true };
+        return { account: acc, uploadId: "", parts: [], failed: true, errorMsg: (e as Error).message };
       }
     })
   );
@@ -411,6 +406,7 @@ export async function handleRemoteUpload(
         session.parts.push({ partNumber: currentPartNum, etag });
       } catch (e) {
         session.failed = true;
+        session.errorMsg = `Part ${currentPartNum} failed: ${(e as Error).message}`;
       }
     }));
 
@@ -440,11 +436,15 @@ export async function handleRemoteUpload(
         await flushBuffer();
       }
     }
-    await flushBuffer();
+    await flushBuffer(); // နောက်ဆုံးကျန်ရှိနေသောအပိုင်းအတွက်
 
     const successes: string[] = [];
+    const finalErrors: string[] = [];
+    
+    // Complete Multipart အဆင့်
     await Promise.all(uploadSessions.map(async (session) => {
       if (session.failed) {
+        finalErrors.push(`[${session.account.label}] ${session.errorMsg}`);
         if (session.uploadId) await abortMultipart(session.account, uniqueName, session.uploadId);
         return;
       }
@@ -452,11 +452,15 @@ export async function handleRemoteUpload(
         await completeMultipart(session.account, uniqueName, session.uploadId, session.parts);
         successes.push(session.account.label);
       } catch (e) {
+        finalErrors.push(`[${session.account.label}] Complete Error: ${(e as Error).message}`);
         await abortMultipart(session.account, uniqueName, session.uploadId);
       }
     }));
 
-    if (successes.length === 0) throw new Error("All R2 uploads failed during processing.");
+    if (successes.length === 0) {
+      throw new Error(`Upload Process Failed: ${finalErrors.join(" | ")}`);
+    }
+
     if (onProgress) onProgress({ loaded: totalUploaded, total: totalUploaded, percent: 100, phase: "complete" });
 
     return {
