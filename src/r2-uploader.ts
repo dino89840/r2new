@@ -1,5 +1,3 @@
-
-
 // ============ R2 Account Config Interface ============
 export interface R2Account {
   accountId: string;
@@ -32,13 +30,14 @@ const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
 };
 
 // ============ Tuning Config ============
-const MULTIPART_THRESHOLD = 30 * 1024 * 1024;    // 8MB — below this, simple PUT
-const PART_SIZE = 30 * 1024 * 1024;              // 10MB per part
-const MAX_RETRIES = 5;
-const RETRY_BASE_DELAY_MS = 2000;
-const INTER_PART_DELAY_MS = 50;
+const MULTIPART_THRESHOLD = 8 * 1024 * 1024;     // 8MB — below this, simple PUT
+const PART_SIZE = 10 * 1024 * 1024;               // 10MB per part
+const MAX_RETRIES = 7;                            // Increased from 5
+const RETRY_BASE_DELAY_MS = 1500;
+const INTER_PART_DELAY_MS = 100;                  // Increased from 50ms
 const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 const INTER_ACCOUNT_DELAY_MS = 500;
+const FETCH_TIMEOUT_MS = 120_000;                 // 2 min timeout per upload request
 
 // ============ Build R2 accounts from env ============
 export function getR2Accounts(env: Env): R2Account[] {
@@ -131,6 +130,32 @@ export function buildDownloadLinks(filename: string, accounts: R2Account[]): str
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============ Fetch with Timeout ============
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number = FETCH_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return res;
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ============ AWS Signature V4 (Web Crypto API) ============
@@ -289,7 +314,6 @@ async function uploadSimplePut(
   contentType: string
 ): Promise<void> {
   await withRetry(`${account.label} PUT`, async () => {
-    // Use UNSIGNED-PAYLOAD to save CPU on hashing large bodies
     const { url, headers } = await buildSignedHeaders(
       account,
       "PUT",
@@ -302,7 +326,7 @@ async function uploadSimplePut(
       UNSIGNED_PAYLOAD
     );
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "PUT",
       headers,
       body,
@@ -335,7 +359,7 @@ async function initiateMultipart(
       emptyHash
     );
 
-    const res = await fetch(url, { method: "POST", headers });
+    const res = await fetchWithTimeout(url, { method: "POST", headers });
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`${res.status} ${text}`);
@@ -369,7 +393,7 @@ async function uploadPart(
         UNSIGNED_PAYLOAD
       );
 
-      const res = await fetch(url, {
+      const res = await fetchWithTimeout(url, {
         method: "PUT",
         headers,
         body: partData,
@@ -417,7 +441,7 @@ async function completeMultipart(
       payloadHash
     );
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "POST",
       headers,
       body: bodyBytes,
@@ -449,7 +473,7 @@ async function abortMultipart(
       emptyHash
     );
 
-    const res = await fetch(url, { method: "DELETE", headers });
+    const res = await fetchWithTimeout(url, { method: "DELETE", headers }, 30_000);
     await res.body?.cancel();
   } catch {
     // best-effort abort
@@ -458,7 +482,7 @@ async function abortMultipart(
 
 // ============================================================
 // Stream download from URL → multipart upload to ONE R2 account
-// Memory: only ONE part buffer (~16MB) at any time
+// Memory: only ONE part buffer (~10MB) at any time
 // Connections: only 2 at peak (1 download + 1 upload)
 // ============================================================
 
@@ -479,14 +503,14 @@ async function streamToOneAccount(
   console.log(`[${account.label}] Starting fresh download → upload for ${objectKey}`);
 
   // Open a fresh download stream for THIS account
-  const dlRes = await fetch(remoteUrl, {
+  const dlRes = await fetchWithTimeout(remoteUrl, {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Accept-Encoding": "identity",
     },
     redirect: "follow",
-  });
+  }, 300_000); // 5 min timeout for initial download connection
 
   if (!dlRes.ok) {
     throw new Error(`Download failed: ${dlRes.status} ${dlRes.statusText}`);
@@ -512,8 +536,8 @@ async function streamToOneAccount(
   let partNumber = 0;
   let totalUploaded = 0;
 
-  // Single reusable buffer — the ONLY large allocation
-  const partBuffer = new Uint8Array(PART_SIZE);
+  // Each call gets its own buffer — safe for parallel execution
+  let partBuffer = new Uint8Array(PART_SIZE);
   let bufferOffset = 0;
 
   const flushPart = async (isFinal: boolean) => {
@@ -522,20 +546,10 @@ async function streamToOneAccount(
     const currentPartNum = partNumber;
     const currentSize = bufferOffset;
 
-    // Create a VIEW for small last part, or use full buffer for full parts
-    // For upload: we need to send exactly bufferOffset bytes
-    // Using subarray (no copy!) for the exact slice to send
-    let partData: Uint8Array;
-    if (bufferOffset === PART_SIZE) {
-      // Full part — we can send the buffer directly
-      // But we need to be careful: buffer will be reused after upload completes
-      // So we must WAIT for upload to finish before reusing buffer
-      partData = partBuffer;
-    } else {
-      // Partial (last) part — create a copy of just the filled portion
-      partData = new Uint8Array(bufferOffset);
-      partData.set(partBuffer.subarray(0, bufferOffset));
-    }
+    // Always create a copy of the data to upload
+    // This ensures the buffer can be safely reused
+    const partData = new Uint8Array(bufferOffset);
+    partData.set(partBuffer.subarray(0, bufferOffset));
 
     console.log(
       `[${account.label}] Part ${currentPartNum} (${(currentSize / 1024 / 1024).toFixed(1)} MB)...`
@@ -545,7 +559,7 @@ async function streamToOneAccount(
     parts.push({ partNumber: currentPartNum, etag });
 
     totalUploaded += currentSize;
-    bufferOffset = 0; // Safe to reset — upload is complete
+    bufferOffset = 0;
 
     if (onProgress) {
       const percent = actualSize > 0
@@ -582,7 +596,6 @@ async function streamToOneAccount(
         bufferOffset += copyLen;
         chunkOffset += copyLen;
 
-        // Buffer full → upload this part (blocks until upload done, then buffer reused)
         if (bufferOffset >= PART_SIZE) {
           await flushPart(false);
         }
@@ -604,7 +617,6 @@ async function streamToOneAccount(
     return totalUploaded;
   } catch (err) {
     console.error(`[${account.label}] Failed, aborting multipart...`);
-    // Cancel the download stream to free the connection
     try { reader.cancel(); } catch { /* ignore */ }
     await abortMultipart(account, objectKey, uploadId);
     throw err;
@@ -629,7 +641,6 @@ async function bufferMultipartUpload(
     for (let i = 0; i < totalParts; i++) {
       const start = i * PART_SIZE;
       const end = Math.min(start + PART_SIZE, body.byteLength);
-      // subarray = no copy, just a view into existing buffer
       const partData = body.subarray(start, end);
       const partNumber = i + 1;
 
@@ -657,6 +668,7 @@ async function bufferMultipartUpload(
 }
 
 // ============ Handle Direct File Upload ============
+// ★ CHANGED: Parallel upload to all accounts simultaneously
 
 export async function handleUpload(
   req: Request,
@@ -687,34 +699,35 @@ export async function handleUpload(
     `File upload: ${file.name} → ${uniqueName} (${(buffer.byteLength / 1024 / 1024).toFixed(1)} MB)`
   );
 
-  // Upload to accounts SEQUENTIALLY (one after another)
+  // ★ PARALLEL: Upload to all accounts simultaneously
+  const uploadPromises = accounts.map(async (account) => {
+    const sizeMB = (buffer.byteLength / 1024 / 1024).toFixed(1);
+
+    if (buffer.byteLength > MULTIPART_THRESHOLD) {
+      console.log(`[${account.label}] Multipart upload (${sizeMB} MB)`);
+      await bufferMultipartUpload(account, uniqueName, buffer, mime);
+    } else {
+      console.log(`[${account.label}] Simple PUT (${sizeMB} MB)`);
+      await uploadSimplePut(account, uniqueName, buffer, mime);
+    }
+
+    console.log(`[${account.label}] Done`);
+    return account.label;
+  });
+
+  const results = await Promise.allSettled(uploadPromises);
+
   const successes: string[] = [];
   const errors: string[] = [];
 
-  for (let idx = 0; idx < accounts.length; idx++) {
-    const account = accounts[idx];
-    try {
-      const sizeMB = (buffer.byteLength / 1024 / 1024).toFixed(1);
-
-      if (buffer.byteLength > MULTIPART_THRESHOLD) {
-        console.log(`[${account.label}] Multipart upload (${sizeMB} MB)`);
-        await bufferMultipartUpload(account, uniqueName, buffer, mime);
-      } else {
-        console.log(`[${account.label}] Simple PUT (${sizeMB} MB)`);
-        await uploadSimplePut(account, uniqueName, buffer, mime);
-      }
-
-      successes.push(account.label);
-      console.log(`[${account.label}] Done`);
-
-      if (idx < accounts.length - 1) {
-        await delay(INTER_ACCOUNT_DELAY_MS);
-      }
-    } catch (err) {
-      const msg = (err as Error).message;
-      console.error(`[${account.label}] Failed: ${msg}`);
-      errors.push(`${account.label}: ${msg}`);
-      // Continue to next account
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === "fulfilled") {
+      successes.push((results[i] as PromiseFulfilledResult<string>).value);
+    } else {
+      const reason = (results[i] as PromiseRejectedResult).reason;
+      const msg = reason?.message || String(reason);
+      console.error(`[${accounts[i].label}] Failed: ${msg}`);
+      errors.push(`${accounts[i].label}: ${msg}`);
     }
   }
 
@@ -732,11 +745,12 @@ export async function handleUpload(
 
 // ============================================================
 // Handle Remote URL Upload
-// SEQUENTIAL: Account-1 download+upload ပြီးမှ Account-2
+// ★ CHANGED: PARALLEL — All accounts download+upload simultaneously
 // Each account gets its OWN fresh download stream
 //
-// Connections at any time: max 2 (1 download + 1 part upload)
-// Memory at any time: ~16MB (one part buffer)
+// Per account: max 2 connections (1 download + 1 part upload)
+// Total: max 4 connections (2 accounts × 2)
+// Memory: ~20MB (2 × 10MB part buffers)
 // ============================================================
 
 export async function handleRemoteUpload(
@@ -764,14 +778,14 @@ export async function handleRemoteUpload(
   let contentLength = 0;
 
   try {
-    const probeRes = await fetch(remoteUrl, {
+    const probeRes = await fetchWithTimeout(remoteUrl, {
       method: "HEAD",
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
       redirect: "follow",
-    });
+    }, 30_000);
 
     remoteContentType =
       probeRes.headers.get("content-type") || "application/octet-stream";
@@ -779,7 +793,6 @@ export async function handleRemoteUpload(
       probeRes.headers.get("content-length") || "0",
       10
     );
-    // Cancel HEAD response body to free connection immediately
     await probeRes.body?.cancel();
   } catch (err) {
     console.warn(`HEAD request failed, will detect from GET: ${(err as Error).message}`);
@@ -800,11 +813,11 @@ export async function handleRemoteUpload(
       : "unknown size";
   console.log(`Remote upload: ${uniqueName} (expected ${expectedSizeMB})`);
 
-  // ========== SMALL FILE: download once, upload sequentially ==========
+  // ========== SMALL FILE: download once, upload in parallel ==========
   const isSmallFile = contentLength > 0 && contentLength <= MULTIPART_THRESHOLD;
 
   if (isSmallFile) {
-    console.log("Small file — download once, upload sequentially");
+    console.log("Small file — download once, upload in parallel");
 
     if (onProgress)
       onProgress({
@@ -814,13 +827,13 @@ export async function handleRemoteUpload(
         phase: "downloading",
       });
 
-    const dlRes = await fetch(remoteUrl, {
+    const dlRes = await fetchWithTimeout(remoteUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
       redirect: "follow",
-    });
+    }, 120_000);
     if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`);
 
     const buffer = new Uint8Array(await dlRes.arrayBuffer());
@@ -833,21 +846,25 @@ export async function handleRemoteUpload(
         phase: "uploading_to_r2",
       });
 
+    // ★ PARALLEL upload for small files too
+    const uploadPromises = accounts.map(async (account) => {
+      await uploadSimplePut(account, uniqueName, buffer, remoteContentType);
+      console.log(`[${account.label}] Small file uploaded`);
+      return account.label;
+    });
+
+    const results = await Promise.allSettled(uploadPromises);
     const successes: string[] = [];
     const errors: string[] = [];
 
-    for (let idx = 0; idx < accounts.length; idx++) {
-      const account = accounts[idx];
-      try {
-        await uploadSimplePut(account, uniqueName, buffer, remoteContentType);
-        successes.push(account.label);
-        console.log(`[${account.label}] Small file uploaded`);
-
-        if (idx < accounts.length - 1) await delay(INTER_ACCOUNT_DELAY_MS);
-      } catch (err) {
-        const msg = (err as Error).message;
-        console.error(`[${account.label}] Failed: ${msg}`);
-        errors.push(`${account.label}: ${msg}`);
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === "fulfilled") {
+        successes.push((results[i] as PromiseFulfilledResult<string>).value);
+      } else {
+        const reason = (results[i] as PromiseRejectedResult).reason;
+        const msg = reason?.message || String(reason);
+        console.error(`[${accounts[i].label}] Failed: ${msg}`);
+        errors.push(`${accounts[i].label}: ${msg}`);
       }
     }
 
@@ -871,70 +888,79 @@ export async function handleRemoteUpload(
     };
   }
 
-  // ========== LARGE FILE: one account at a time, each with own download ==========
+  // ========== LARGE FILE: all accounts in PARALLEL, each with own download ==========
+
+  console.log(`\nLarge file — uploading to ${accounts.length} accounts in PARALLEL`);
+
+  // Track progress per account for combined reporting
+  const progressMap: Record<string, { loaded: number; total: number; percent: number }> = {};
+  for (const acc of accounts) {
+    progressMap[acc.label] = { loaded: 0, total: contentLength, percent: 0 };
+  }
+
+  const uploadPromises = accounts.map(async (account, idx) => {
+    console.log(
+      `\n========== [${account.label}] (${idx + 1}/${accounts.length}) ==========`
+    );
+
+    const uploadedSize = await streamToOneAccount(
+      account,
+      uniqueName,
+      remoteUrl,
+      remoteContentType,
+      contentLength,
+      onProgress
+        ? (info) => {
+            // Update this account's progress
+            progressMap[info.account] = {
+              loaded: info.loaded,
+              total: info.total,
+              percent: info.percent,
+            };
+
+            // Calculate combined progress (average of all accounts)
+            let totalPercent = 0;
+            for (const key of Object.keys(progressMap)) {
+              totalPercent += progressMap[key].percent;
+            }
+            const overallPercent = Math.min(
+              99,
+              Math.round(totalPercent / accounts.length)
+            );
+
+            onProgress({
+              loaded: info.loaded,
+              total: info.total,
+              percent: overallPercent,
+              phase: `${info.account}_part_${info.partNum}`,
+            });
+          }
+        : undefined
+    );
+
+    console.log(
+      `[${account.label}] Success: ${(uploadedSize / 1024 / 1024).toFixed(1)} MB`
+    );
+
+    return { label: account.label, size: uploadedSize };
+  });
+
+  const results = await Promise.allSettled(uploadPromises);
 
   const successes: string[] = [];
   const errors: string[] = [];
   let finalSize = 0;
 
-  for (let idx = 0; idx < accounts.length; idx++) {
-    const account = accounts[idx];
-
-    console.log(
-      `\n========== [${account.label}] (${idx + 1}/${accounts.length}) ==========`
-    );
-
-    if (onProgress) {
-      onProgress({
-        loaded: 0,
-        total: contentLength,
-        percent: 0,
-        phase: `${account.label}_starting`,
-      });
-    }
-
-    try {
-      const uploadedSize = await streamToOneAccount(
-        account,
-        uniqueName,
-        remoteUrl,
-        remoteContentType,
-        contentLength,
-        onProgress
-          ? (info) => {
-              // Calculate overall progress: account index + per-account progress
-              const accountWeight = 100 / accounts.length;
-              const accountBase = idx * accountWeight;
-              const withinAccount = (info.percent / 100) * accountWeight;
-              const overallPercent = Math.min(99, Math.round(accountBase + withinAccount));
-
-              onProgress({
-                loaded: info.loaded,
-                total: info.total,
-                percent: overallPercent,
-                phase: `${info.account}_part_${info.partNum}`,
-              });
-            }
-          : undefined
-      );
-
-      successes.push(account.label);
-      if (uploadedSize > finalSize) finalSize = uploadedSize;
-
-      console.log(
-        `[${account.label}] Success: ${(uploadedSize / 1024 / 1024).toFixed(1)} MB`
-      );
-
-      // Delay before next account
-      if (idx < accounts.length - 1) {
-        console.log(`Pausing ${INTER_ACCOUNT_DELAY_MS}ms before next account...`);
-        await delay(INTER_ACCOUNT_DELAY_MS);
-      }
-    } catch (err) {
-      const msg = (err as Error).message;
-      console.error(`[${account.label}] FAILED: ${msg}`);
-      errors.push(`${account.label}: ${msg}`);
-      // Don't stop — try next account
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === "fulfilled") {
+      const val = (results[i] as PromiseFulfilledResult<{ label: string; size: number }>).value;
+      successes.push(val.label);
+      if (val.size > finalSize) finalSize = val.size;
+    } else {
+      const reason = (results[i] as PromiseRejectedResult).reason;
+      const msg = reason?.message || String(reason);
+      console.error(`[${accounts[i].label}] FAILED: ${msg}`);
+      errors.push(`${accounts[i].label}: ${msg}`);
     }
   }
 
@@ -962,6 +988,3 @@ export async function handleRemoteUpload(
     uploadedTo: successes,
   };
 }
-
-
-
