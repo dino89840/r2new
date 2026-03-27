@@ -30,11 +30,12 @@ const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
 };
 
 // ============ Tuning Config ============
-const MULTIPART_THRESHOLD = 10 * 1024 * 1024;    // 10MB (Memory သက်သာစေရန် လျှော့ချထားသည်)
-const PART_SIZE = 10 * 1024 * 1024;              // 10MB per part (S3 Standard အရ အနည်းဆုံး 5MB လိုအပ်သည်)
+const MULTIPART_THRESHOLD = 10 * 1024 * 1024;    // 10MB - below this, simple PUT
+const PART_SIZE = 10 * 1024 * 1024;              // 10MB per part (S3 minimum is 5MB)
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 2000;
 const INTER_PART_DELAY_MS = 50;
+const INTER_ACCOUNT_DELAY_MS = 500;
 const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 
 // ============ Build R2 accounts from env ============
@@ -85,11 +86,26 @@ function getExtension(filename: string, contentType?: string): string {
     "video/x-matroska": ".mkv",
     "video/quicktime": ".mov",
     "video/x-msvideo": ".avi",
+    "video/x-flv": ".flv",
     "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/flac": ".flac",
     "image/jpeg": ".jpg",
     "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
     "application/pdf": ".pdf",
     "application/zip": ".zip",
+    "application/x-rar-compressed": ".rar",
+    "application/x-7z-compressed": ".7z",
+    "application/gzip": ".gz",
+    "application/json": ".json",
+    "text/plain": ".txt",
+    "text/html": ".html",
+    "application/octet-stream": ".bin",
   };
 
   if (contentType) {
@@ -248,16 +264,80 @@ async function abortMultipart(account: R2Account, objectKey: string, uploadId: s
   } catch {}
 }
 
+// ============ Handle Direct Form Upload ============
+
+async function bufferMultipartUpload(
+  account: R2Account, objectKey: string, body: Uint8Array, contentType: string, onPartDone?: (partNum: number, totalParts: number) => void
+): Promise<void> {
+  const uploadId = await initiateMultipart(account, objectKey, contentType);
+  try {
+    const totalParts = Math.ceil(body.byteLength / PART_SIZE);
+    const parts: { partNumber: number; etag: string }[] = [];
+
+    for (let i = 0; i < totalParts; i++) {
+      const start = i * PART_SIZE;
+      const end = Math.min(start + PART_SIZE, body.byteLength);
+      const partData = body.subarray(start, end);
+      const partNumber = i + 1;
+
+      const etag = await uploadPart(account, objectKey, uploadId, partNumber, partData);
+      parts.push({ partNumber, etag });
+
+      if (onPartDone) onPartDone(partNumber, totalParts);
+      if (i < totalParts - 1) await delay(INTER_PART_DELAY_MS);
+    }
+
+    await completeMultipart(account, objectKey, uploadId, parts);
+  } catch (err) {
+    await abortMultipart(account, objectKey, uploadId);
+    throw err;
+  }
+}
+
+export async function handleUpload(req: Request, env: Env): Promise<{ filename: string; size: number; links: string[]; uploadedTo: string[] }> {
+  const contentType = req.headers.get("content-type") || "";
+  if (!contentType.includes("multipart/form-data")) throw new Error("Unsupported content type");
+
+  const accounts = getR2Accounts(env);
+  const formData = await req.formData();
+  const file = formData.get("file") as File | null;
+  if (!file) throw new Error("No file provided");
+
+  const ext = getExtension(file.name, file.type);
+  const uniqueName = generateUniqueFilename(ext);
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  const mime = file.type || "application/octet-stream";
+
+  const successes: string[] = [];
+  const errors: string[] = [];
+
+  for (let idx = 0; idx < accounts.length; idx++) {
+    const account = accounts[idx];
+    try {
+      if (buffer.byteLength > MULTIPART_THRESHOLD) {
+        await bufferMultipartUpload(account, uniqueName, buffer, mime);
+      } else {
+        await uploadSimplePut(account, uniqueName, buffer, mime);
+      }
+      successes.push(account.label);
+      if (idx < accounts.length - 1) await delay(INTER_ACCOUNT_DELAY_MS);
+    } catch (err) {
+      errors.push(`${account.label}: ${(err as Error).message}`);
+    }
+  }
+
+  if (successes.length === 0) throw new Error(`All R2 uploads failed: ${errors.join("; ")}`);
+
+  return { filename: uniqueName, size: buffer.byteLength, links: buildDownloadLinks(uniqueName, accounts), uploadedTo: successes };
+}
+
 // ============================================================
-// Handle Remote URL Upload (Concurrent Pipeline / ရေပိုက်သဖွယ်)
+// Handle Remote URL Upload (Concurrent Pipeline)
 // ============================================================
 
 export async function handleRemoteUpload(
-  remoteUrl: string,
-  env: Env,
-  onProgress?: (progress: { loaded: number; total: number; percent: number; phase: string }) => void
+  remoteUrl: string, env: Env, onProgress?: (progress: { loaded: number; total: number; percent: number; phase: string }) => void
 ): Promise<{ filename: string; size: number; links: string[]; uploadedTo: string[] }> {
-  
   const accounts = getR2Accounts(env);
   if (onProgress) onProgress({ loaded: 0, total: 0, percent: 0, phase: "connecting" });
 
@@ -275,11 +355,9 @@ export async function handleRemoteUpload(
 
   const uniqueName = generateUniqueFilename(getExtension(new URL(remoteUrl).pathname || "file", remoteContentType));
 
-  // Streaming ကို စတင်ဒေါင်းလုဒ်ဆွဲပါမည်
   const dlRes = await fetch(remoteUrl, { redirect: "follow" });
   if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`);
 
-  // သေးငယ်သောဖိုင်များအတွက် ရိုးရှင်းစွာ တင်ခြင်း
   if (contentLength > 0 && contentLength <= MULTIPART_THRESHOLD) {
     const buffer = new Uint8Array(await dlRes.arrayBuffer());
     const successes: string[] = [];
@@ -297,10 +375,7 @@ export async function handleRemoteUpload(
     return { filename: uniqueName, size: buffer.byteLength, links: buildDownloadLinks(uniqueName, accounts), uploadedTo: successes };
   }
 
-  // ဖိုင်ကြီးများအတွက် ရေပိုက်သဖွယ် (Pipeline) Multipart Upload
   const reader = dlRes.body!.getReader();
-  
-  // အကောင့်အားလုံးအတွက် Multipart များကို ပြိုင်တူ စတင်ပါ
   const uploadSessions = await Promise.all(
     accounts.map(async (acc) => {
       try {
@@ -322,7 +397,6 @@ export async function handleRemoteUpload(
     partNumber++;
     const currentPartNum = partNumber;
 
-    // Chunks များကို Buffer တစ်ခုတည်းအဖြစ် ပေါင်းစည်းခြင်း
     const mergedBuffer = new Uint8Array(currentChunkSize);
     let offset = 0;
     for (const chunk of chunks) {
@@ -330,14 +404,12 @@ export async function handleRemoteUpload(
       offset += chunk.byteLength;
     }
 
-    // အကောင့်အားလုံးဆီသို့ ပိုင်းဖြတ်ထားသော အပိုင်းကို ပြိုင်တူ (Parallel) တင်ခြင်း
     await Promise.all(uploadSessions.map(async (session) => {
       if (session.failed) return;
       try {
         const etag = await uploadPart(session.account, uniqueName, session.uploadId, currentPartNum, mergedBuffer);
         session.parts.push({ partNumber: currentPartNum, etag });
       } catch (e) {
-        console.error(`[${session.account.label}] Part ${currentPartNum} failed. Stopping this account.`);
         session.failed = true;
       }
     }));
@@ -364,16 +436,13 @@ export async function handleRemoteUpload(
       chunks.push(value);
       currentChunkSize += value.byteLength;
 
-      // 10MB ပြည့်တိုင်း Flush လုပ်ပြီး R2 သို့ လှမ်းတင်ပါမည် (Memory သက်သာစေရန်)
       if (currentChunkSize >= PART_SIZE) {
         await flushBuffer();
       }
     }
-    await flushBuffer(); // ကျန်ရှိနေသော နောက်ဆုံးအပိုင်းကို တင်ရန်
+    await flushBuffer();
 
     const successes: string[] = [];
-    
-    // Upload အားလုံးကို အဆုံးသတ်အတည်ပြုခြင်း (Complete)
     await Promise.all(uploadSessions.map(async (session) => {
       if (session.failed) {
         if (session.uploadId) await abortMultipart(session.account, uniqueName, session.uploadId);
@@ -388,7 +457,6 @@ export async function handleRemoteUpload(
     }));
 
     if (successes.length === 0) throw new Error("All R2 uploads failed during processing.");
-
     if (onProgress) onProgress({ loaded: totalUploaded, total: totalUploaded, percent: 100, phase: "complete" });
 
     return {
@@ -398,7 +466,6 @@ export async function handleRemoteUpload(
       uploadedTo: successes,
     };
   } catch (err) {
-    // ပျက်ကျပါက အစမ်းတင်ထားသည်များကို ဖျက်သိမ်းမည်
     await Promise.all(uploadSessions.map(s => s.uploadId && abortMultipart(s.account, uniqueName, s.uploadId)));
     throw err;
   }
