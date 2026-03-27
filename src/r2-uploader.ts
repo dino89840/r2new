@@ -382,75 +382,6 @@ async function abortMultipart(
   } catch {}
 }
 
-// ============================================================
-// Pipe-style streaming: ReadableStream reader -> multipart parts
-// Memory ထဲမှာ part တစ်ခုစာ (25MB) ပဲ ကိုင်ထားပြီး တိုက်ရိုက် upload
-// ============================================================
-
-interface StreamUploadResult {
-  size: number;
-  parts: { partNumber: number; etag: string }[];
-}
-
-async function pipeStreamToMultipart(
-  account: R2Account,
-  objectKey: string,
-  uploadId: string,
-  reader: ReadableStreamDefaultReader<Uint8Array>
-): Promise<StreamUploadResult> {
-  let chunks: Uint8Array[] = [];
-  let currentChunkSize = 0;
-  let partNumber = 0;
-  let totalUploaded = 0;
-  const parts: { partNumber: number; etag: string }[] = [];
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    chunks.push(value);
-    currentChunkSize += value.byteLength;
-
-    if (currentChunkSize >= PART_SIZE) {
-      partNumber++;
-      const merged = mergeChunks(chunks, currentChunkSize);
-      const etag = await uploadPart(
-        account,
-        objectKey,
-        uploadId,
-        partNumber,
-        merged
-      );
-      parts.push({ partNumber, etag });
-      totalUploaded += currentChunkSize;
-
-      // GC — ဟောင်းတွေ လွှတ်
-      chunks = [];
-      currentChunkSize = 0;
-
-      if (partNumber < 9999) await delay(INTER_PART_DELAY_MS);
-    }
-  }
-
-  // Flush remaining data
-  if (currentChunkSize > 0) {
-    partNumber++;
-    const merged = mergeChunks(chunks, currentChunkSize);
-    const etag = await uploadPart(
-      account,
-      objectKey,
-      uploadId,
-      partNumber,
-      merged
-    );
-    parts.push({ partNumber, etag });
-    totalUploaded += currentChunkSize;
-    chunks = [];
-  }
-
-  return { size: totalUploaded, parts };
-}
-
 function mergeChunks(chunks: Uint8Array[], totalSize: number): Uint8Array {
   if (chunks.length === 1) return chunks[0];
   const merged = new Uint8Array(totalSize);
@@ -460,51 +391,6 @@ function mergeChunks(chunks: Uint8Array[], totalSize: number): Uint8Array {
     offset += chunk.byteLength;
   }
   return merged;
-}
-
-// ============================================================
-// Single account: stream pipe upload (small=PUT, large=multipart)
-// ============================================================
-
-async function pipeUploadSingleAccount(
-  account: R2Account,
-  objectKey: string,
-  stream: ReadableStream<Uint8Array>,
-  contentType: string,
-  contentLength: number
-): Promise<{ size: number }> {
-  const reader = stream.getReader();
-
-  // Small file — read all then PUT
-  if (contentLength > 0 && contentLength <= MULTIPART_THRESHOLD) {
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
-    }
-    const buffer = mergeChunks(chunks, total);
-    await uploadSimplePut(account, objectKey, buffer, contentType);
-    return { size: buffer.byteLength };
-  }
-
-  // Large file — stream multipart
-  const uploadId = await initiateMultipart(account, objectKey, contentType);
-  try {
-    const result = await pipeStreamToMultipart(
-      account,
-      objectKey,
-      uploadId,
-      reader
-    );
-    await completeMultipart(account, objectKey, uploadId, result.parts);
-    return { size: result.size };
-  } catch (err) {
-    await abortMultipart(account, objectKey, uploadId);
-    throw err;
-  }
 }
 
 // ============ Handle Direct Form Upload (File Upload tab) ============
@@ -582,12 +468,11 @@ export async function handleUpload(
 }
 
 // ============================================================
-// Handle Remote URL Upload — True pipe/stream approach
+// Handle Remote URL Upload — Fixed Memory/Stream Approach
 //
-// Download တစ်ကြိမ်တည်း → stream.tee() နဲ့ ခွဲ →
-// Account နှစ်ခုကို parallel pipe upload
-//
-// Memory usage: part တစ်ခုစာ × 2 accounts = ~50MB max
+// tee() ကိုမသုံးတော့ဘဲ memory ထဲမှာ 25MB ပြည့်တာနဲ့ 
+// account နှစ်ခုလုံးဆီကို တပြိုင်နက်လှမ်းတင်ပါမယ်။
+// OOM ပြဿနာနဲ့ Stream ကြန့်ကြာမှုကို အပြည့်အဝ ဖြေရှင်းထားပါတယ်။
 // ============================================================
 
 export async function handleRemoteUpload(
@@ -607,7 +492,6 @@ export async function handleRemoteUpload(
 }> {
   const accounts = getR2Accounts(env);
 
-  // Validate URL
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(remoteUrl);
@@ -621,7 +505,6 @@ export async function handleRemoteUpload(
   if (onProgress)
     onProgress({ loaded: 0, total: 0, percent: 0, phase: "connecting" });
 
-  // HEAD probe — content info ယူ
   let remoteContentType = "application/octet-stream";
   let contentLength = 0;
 
@@ -655,7 +538,6 @@ export async function handleRemoteUpload(
       phase: "downloading & uploading",
     });
 
-  // GET download start
   const dlRes = await fetch(remoteUrl, {
     method: "GET",
     headers: FETCH_HEADERS,
@@ -674,45 +556,121 @@ export async function handleRemoteUpload(
 
   const actualContentType =
     dlRes.headers.get("content-type") || remoteContentType;
-  const actualLength = parseInt(
-    dlRes.headers.get("content-length") || "0",
-    10
-  );
-  const totalSize = actualLength || contentLength;
+  
+  // Storage arrays to hold upload details for each account
+  const activeUploads: {
+    account: R2Account;
+    uploadId: string | null;
+    parts: { partNumber: number; etag: string }[];
+    isFailed: boolean;
+    error?: string;
+  }[] = accounts.map((acc) => ({
+    account: acc,
+    uploadId: null,
+    parts: [],
+    isFailed: false,
+  }));
 
-  // ===== Stream ကို tee() နဲ့ accounts အရေအတွက်အတိုင်း ခွဲ =====
-  // account 2 ခုရှိလို့ tee() တစ်ခါပဲ ခေါ်ရမယ်
-  const [stream1, stream2] = dlRes.body.tee();
-  const streams = [stream1, stream2];
-
-  // Parallel pipe upload — account တစ်ခုချင်းစီ stream တစ်ခုစီရ
-  const results = await Promise.allSettled(
-    accounts.map((account, index) =>
-      pipeUploadSingleAccount(
-        account,
+  // Initial setup: For large streaming files, we default to Multipart Upload directly
+  for (const upload of activeUploads) {
+    try {
+      upload.uploadId = await initiateMultipart(
+        upload.account,
         uniqueName,
-        streams[index],
-        actualContentType,
-        totalSize
-      )
-    )
-  );
+        actualContentType
+      );
+    } catch (err) {
+      upload.isFailed = true;
+      upload.error = (err as Error).message;
+    }
+  }
 
+  let totalUploadedSize = 0;
+  let partNumber = 0;
+
+  const reader = dlRes.body.getReader();
+  let chunks: Uint8Array[] = [];
+  let currentChunkSize = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (value) {
+        chunks.push(value);
+        currentChunkSize += value.byteLength;
+      }
+
+      // 25MB ပြည့်သွားရင် ဒါမှမဟုတ် Stream ပြီးသွားရင် (done === true) Part အနေနဲ့လှမ်းတင်မယ်
+      if (currentChunkSize >= PART_SIZE || (done && currentChunkSize > 0)) {
+        partNumber++;
+        const mergedData = mergeChunks(chunks, currentChunkSize);
+        totalUploadedSize += currentChunkSize;
+        
+        // Account တွေအားလုံးကို Parallel လှမ်းတင်မယ်
+        const uploadPromises = activeUploads.map(async (upload) => {
+          if (upload.isFailed || !upload.uploadId) return;
+          try {
+            const etag = await uploadPart(
+              upload.account,
+              uniqueName,
+              upload.uploadId,
+              partNumber,
+              mergedData
+            );
+            upload.parts.push({ partNumber, etag });
+          } catch (err) {
+            upload.isFailed = true;
+            upload.error = (err as Error).message;
+          }
+        });
+
+        await Promise.all(uploadPromises);
+
+        // Memory ကို အသစ်ပြန်ခေါ်မယ် (GC)
+        chunks = [];
+        currentChunkSize = 0;
+        
+        if (!done) await delay(INTER_PART_DELAY_MS);
+      }
+
+      if (done) break;
+    }
+  } catch (err) {
+    // Stream ဖတ်နေတုန်း Error တက်ရင် Multipart တွေ အကုန်ဖျက်သိမ်းမယ်
+    for (const upload of activeUploads) {
+      if (upload.uploadId) {
+        await abortMultipart(upload.account, uniqueName, upload.uploadId);
+      }
+    }
+    throw new Error(`Failed while reading remote stream: ${(err as Error).message}`);
+  }
+
+  // Complete Multipart Upload for all successful accounts
   const successes: string[] = [];
   const errors: string[] = [];
-  let finalSize = 0;
 
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i];
-    if (result.status === "fulfilled") {
-      successes.push(accounts[i].label);
-      if (result.value.size > finalSize) finalSize = result.value.size;
-    } else {
-      errors.push(`${accounts[i].label}: ${result.reason?.message || "Unknown error"}`);
-      // Cancel unused stream on failure
-      try {
-        await streams[i].cancel();
-      } catch {}
+  for (const upload of activeUploads) {
+    if (upload.isFailed || !upload.uploadId) {
+      errors.push(`${upload.account.label}: ${upload.error || "Initialization failed"}`);
+      if (upload.uploadId) {
+        await abortMultipart(upload.account, uniqueName, upload.uploadId).catch(() => {});
+      }
+      continue;
+    }
+
+    try {
+      // Data လုံးဝမပါခဲ့ရင် (Empty file) Empty buffer လေးတစ်ခု Put နဲ့ အတင်းထည့်ပေးဖို့လိုနိုင်တယ်
+      if (totalUploadedSize === 0) {
+         await abortMultipart(upload.account, uniqueName, upload.uploadId);
+         await uploadSimplePut(upload.account, uniqueName, new Uint8Array(0), actualContentType);
+      } else {
+         await completeMultipart(upload.account, uniqueName, upload.uploadId, upload.parts);
+      }
+      successes.push(upload.account.label);
+    } catch (err) {
+      errors.push(`${upload.account.label}: ${(err as Error).message}`);
+      await abortMultipart(upload.account, uniqueName, upload.uploadId).catch(() => {});
     }
   }
 
@@ -722,16 +680,16 @@ export async function handleRemoteUpload(
 
   if (onProgress)
     onProgress({
-      loaded: finalSize || totalSize,
-      total: finalSize || totalSize,
+      loaded: totalUploadedSize,
+      total: totalUploadedSize,
       percent: 100,
       phase: "complete",
     });
 
   return {
     filename: uniqueName,
-    size: finalSize || totalSize,
-    links: buildDownloadLinks(uniqueName, accounts),
+    size: totalUploadedSize,
+    links: buildDownloadLinks(uniqueName, successes.map(label => getR2Accounts(env).find(a => a.label === label)!)),
     uploadedTo: successes,
   };
 }
