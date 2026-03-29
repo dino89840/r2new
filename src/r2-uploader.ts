@@ -31,13 +31,44 @@ const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
 
 // ============ Tuning Config ============
 const MULTIPART_THRESHOLD = 5 * 1024 * 1024;      // 5MB — below this, simple PUT
-const PART_SIZE = 10 * 1024 * 1024;                // 10MB per part (Worker-friendly)
+const PART_SIZE = 10 * 1024 * 1024;                // 10MB per part (Worker memory-safe)
+const CHUNK_SIZE = 80 * 1024 * 1024;               // 80MB per client chunk (under 100MB plan limit)
 const MAX_RETRIES = 7;
 const RETRY_BASE_DELAY_MS = 1500;
 const INTER_PART_DELAY_MS = 150;
 const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 const INTER_ACCOUNT_DELAY_MS = 500;
 const FETCH_TIMEOUT_MS = 120_000;
+
+// ============ In-flight multipart upload sessions ============
+// Stores active upload sessions for chunked uploads
+// Key: sessionId, Value: session data per account
+interface UploadSession {
+  objectKey: string;
+  contentType: string;
+  accounts: {
+    account: R2Account;
+    uploadId: string;
+    parts: { partNumber: number; etag: string }[];
+    nextPartNumber: number;
+  }[];
+  totalSize: number;
+  uploadedSize: number;
+  createdAt: number;
+}
+
+// Global session store (lives as long as the isolate)
+const uploadSessions = new Map<string, UploadSession>();
+
+// Clean up old sessions (older than 30 min)
+function cleanupSessions(): void {
+  const now = Date.now();
+  for (const [id, session] of uploadSessions) {
+    if (now - session.createdAt > 30 * 60 * 1000) {
+      uploadSessions.delete(id);
+    }
+  }
+}
 
 // ============ Build R2 accounts from env ============
 export function getR2Accounts(env: Env): R2Account[] {
@@ -75,6 +106,11 @@ function generateUniqueFilename(extension: string): string {
   const randomBytes = crypto.getRandomValues(new Uint8Array(8));
   const randomHex = arrayBufferToHex(randomBytes.buffer);
   return `${timestamp}_${randomHex}${extension}`;
+}
+
+function generateSessionId(): string {
+  const randomBytes = crypto.getRandomValues(new Uint8Array(16));
+  return arrayBufferToHex(randomBytes.buffer);
 }
 
 function getExtension(filename: string, contentType?: string): string {
@@ -481,145 +517,7 @@ async function abortMultipart(
 }
 
 // ============================================================
-// Stream download from URL → multipart upload to ONE R2 account
-// Memory: only ONE part buffer (~10MB) at any time
-// ============================================================
-
-async function streamToOneAccount(
-  account: R2Account,
-  objectKey: string,
-  remoteUrl: string,
-  contentType: string,
-  expectedSize: number,
-  onProgress?: (info: {
-    account: string;
-    loaded: number;
-    total: number;
-    percent: number;
-    partNum: number;
-  }) => void
-): Promise<number> {
-  console.log(`[${account.label}] Starting download → upload for ${objectKey}`);
-
-  const dlRes = await fetchWithTimeout(remoteUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Encoding": "identity",
-    },
-    redirect: "follow",
-  }, 300_000);
-
-  if (!dlRes.ok) {
-    throw new Error(`Download failed: ${dlRes.status} ${dlRes.statusText}`);
-  }
-
-  const actualSize = parseInt(dlRes.headers.get("content-length") || "0", 10) || expectedSize;
-
-  // If small enough for simple PUT
-  if (actualSize > 0 && actualSize <= MULTIPART_THRESHOLD) {
-    console.log(`[${account.label}] Small file — simple PUT`);
-    const buf = new Uint8Array(await dlRes.arrayBuffer());
-    await uploadSimplePut(account, objectKey, buf, contentType);
-    return buf.byteLength;
-  }
-
-  // Initiate multipart
-  const uploadId = await initiateMultipart(account, objectKey, contentType);
-  console.log(`[${account.label}] Multipart initiated: ${uploadId.substring(0, 16)}...`);
-
-  const reader = dlRes.body!.getReader();
-  const parts: { partNumber: number; etag: string }[] = [];
-
-  let partNumber = 0;
-  let totalUploaded = 0;
-  let partBuffer = new Uint8Array(PART_SIZE);
-  let bufferOffset = 0;
-
-  const flushPart = async (isFinal: boolean) => {
-    if (bufferOffset === 0) return;
-    partNumber++;
-    const currentPartNum = partNumber;
-    const currentSize = bufferOffset;
-
-    const partData = new Uint8Array(bufferOffset);
-    partData.set(partBuffer.subarray(0, bufferOffset));
-    bufferOffset = 0; // Reset immediately so buffer can be reused
-
-    console.log(
-      `[${account.label}] Part ${currentPartNum} (${(currentSize / 1024 / 1024).toFixed(1)} MB)...`
-    );
-
-    const etag = await uploadPart(account, objectKey, uploadId, currentPartNum, partData);
-    parts.push({ partNumber: currentPartNum, etag });
-
-    totalUploaded += currentSize;
-
-    if (onProgress) {
-      const percent = actualSize > 0
-        ? Math.min(99, Math.round((totalUploaded / actualSize) * 100))
-        : 0;
-      onProgress({
-        account: account.label,
-        loaded: totalUploaded,
-        total: actualSize,
-        percent,
-        partNum: currentPartNum,
-      });
-    }
-
-    if (!isFinal) {
-      await delay(INTER_PART_DELAY_MS);
-    }
-  };
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      let chunkOffset = 0;
-      while (chunkOffset < value.byteLength) {
-        const spaceLeft = PART_SIZE - bufferOffset;
-        const copyLen = Math.min(spaceLeft, value.byteLength - chunkOffset);
-
-        partBuffer.set(
-          value.subarray(chunkOffset, chunkOffset + copyLen),
-          bufferOffset
-        );
-        bufferOffset += copyLen;
-        chunkOffset += copyLen;
-
-        if (bufferOffset >= PART_SIZE) {
-          await flushPart(false);
-        }
-      }
-    }
-
-    // Flush remaining bytes
-    await flushPart(true);
-
-    if (parts.length === 0) {
-      throw new Error("No data downloaded");
-    }
-
-    await completeMultipart(account, objectKey, uploadId, parts);
-    console.log(
-      `[${account.label}] Complete! ${parts.length} parts, ${(totalUploaded / 1024 / 1024).toFixed(1)} MB`
-    );
-
-    return totalUploaded;
-  } catch (err) {
-    console.error(`[${account.label}] Failed, aborting multipart...`);
-    try { reader.cancel(); } catch { /* ignore */ }
-    await abortMultipart(account, objectKey, uploadId);
-    throw err;
-  }
-}
-
-// ============================================================
-// Stream upload from request body to ONE R2 account
-// ★ NEW: Streams directly from request — no full buffer in memory
+// Stream from request body to R2 (for streaming uploads)
 // ============================================================
 
 async function streamRequestToOneAccount(
@@ -630,7 +528,6 @@ async function streamRequestToOneAccount(
   expectedSize: number,
   onPartDone?: (partNum: number, uploaded: number) => void
 ): Promise<number> {
-  // For small files, read the whole thing (it's small anyway)
   if (expectedSize > 0 && expectedSize <= MULTIPART_THRESHOLD) {
     const reader = stream.getReader();
     const chunks: Uint8Array[] = [];
@@ -651,7 +548,6 @@ async function streamRequestToOneAccount(
     return buf.byteLength;
   }
 
-  // Multipart streaming upload
   const uploadId = await initiateMultipart(account, objectKey, contentType);
   console.log(`[${account.label}] Multipart initiated for direct upload`);
 
@@ -659,7 +555,7 @@ async function streamRequestToOneAccount(
   const parts: { partNumber: number; etag: string }[] = [];
   let partNumber = 0;
   let totalUploaded = 0;
-  let partBuffer = new Uint8Array(PART_SIZE);
+  const partBuffer = new Uint8Array(PART_SIZE);
   let bufferOffset = 0;
 
   const flushPart = async (isFinal: boolean) => {
@@ -728,11 +624,480 @@ async function streamRequestToOneAccount(
   }
 }
 
-// ============ Handle Direct File Upload ============
-// ★ CHANGED: Sequential upload using streams
-// Account 1 streams from request, Account 2 uses stored parts
-// For reliability, we buffer the data once and upload to each account sequentially
-// This avoids the memory explosion of formData().arrayBuffer()
+// ============================================================
+// Stream download from URL → multipart upload to ONE R2 account
+// ============================================================
+
+async function streamToOneAccount(
+  account: R2Account,
+  objectKey: string,
+  remoteUrl: string,
+  contentType: string,
+  expectedSize: number,
+  onProgress?: (info: {
+    account: string;
+    loaded: number;
+    total: number;
+    percent: number;
+    partNum: number;
+  }) => void
+): Promise<number> {
+  console.log(`[${account.label}] Starting download → upload for ${objectKey}`);
+
+  const dlRes = await fetchWithTimeout(remoteUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept-Encoding": "identity",
+    },
+    redirect: "follow",
+  }, 300_000);
+
+  if (!dlRes.ok) {
+    throw new Error(`Download failed: ${dlRes.status} ${dlRes.statusText}`);
+  }
+
+  const actualSize = parseInt(dlRes.headers.get("content-length") || "0", 10) || expectedSize;
+
+  if (actualSize > 0 && actualSize <= MULTIPART_THRESHOLD) {
+    console.log(`[${account.label}] Small file — simple PUT`);
+    const buf = new Uint8Array(await dlRes.arrayBuffer());
+    await uploadSimplePut(account, objectKey, buf, contentType);
+    return buf.byteLength;
+  }
+
+  const uploadId = await initiateMultipart(account, objectKey, contentType);
+  console.log(`[${account.label}] Multipart initiated: ${uploadId.substring(0, 16)}...`);
+
+  const reader = dlRes.body!.getReader();
+  const parts: { partNumber: number; etag: string }[] = [];
+
+  let partNumber = 0;
+  let totalUploaded = 0;
+  const partBuffer = new Uint8Array(PART_SIZE);
+  let bufferOffset = 0;
+
+  const flushPart = async (isFinal: boolean) => {
+    if (bufferOffset === 0) return;
+    partNumber++;
+    const currentPartNum = partNumber;
+    const currentSize = bufferOffset;
+
+    const partData = new Uint8Array(bufferOffset);
+    partData.set(partBuffer.subarray(0, bufferOffset));
+    bufferOffset = 0;
+
+    console.log(
+      `[${account.label}] Part ${currentPartNum} (${(currentSize / 1024 / 1024).toFixed(1)} MB)...`
+    );
+
+    const etag = await uploadPart(account, objectKey, uploadId, currentPartNum, partData);
+    parts.push({ partNumber: currentPartNum, etag });
+
+    totalUploaded += currentSize;
+
+    if (onProgress) {
+      const percent = actualSize > 0
+        ? Math.min(99, Math.round((totalUploaded / actualSize) * 100))
+        : 0;
+      onProgress({
+        account: account.label,
+        loaded: totalUploaded,
+        total: actualSize,
+        percent,
+        partNum: currentPartNum,
+      });
+    }
+
+    if (!isFinal) {
+      await delay(INTER_PART_DELAY_MS);
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      let chunkOffset = 0;
+      while (chunkOffset < value.byteLength) {
+        const spaceLeft = PART_SIZE - bufferOffset;
+        const copyLen = Math.min(spaceLeft, value.byteLength - chunkOffset);
+
+        partBuffer.set(
+          value.subarray(chunkOffset, chunkOffset + copyLen),
+          bufferOffset
+        );
+        bufferOffset += copyLen;
+        chunkOffset += copyLen;
+
+        if (bufferOffset >= PART_SIZE) {
+          await flushPart(false);
+        }
+      }
+    }
+
+    await flushPart(true);
+
+    if (parts.length === 0) {
+      throw new Error("No data downloaded");
+    }
+
+    await completeMultipart(account, objectKey, uploadId, parts);
+    console.log(
+      `[${account.label}] Complete! ${parts.length} parts, ${(totalUploaded / 1024 / 1024).toFixed(1)} MB`
+    );
+
+    return totalUploaded;
+  } catch (err) {
+    console.error(`[${account.label}] Failed, aborting multipart...`);
+    try { reader.cancel(); } catch { /* ignore */ }
+    await abortMultipart(account, objectKey, uploadId);
+    throw err;
+  }
+}
+
+// ============================================================
+// CHUNKED UPLOAD API — Client sends file in multiple HTTP requests
+// This bypasses the Cloudflare request body size limit (100MB/200MB/500MB)
+//
+// Flow:
+//   1. POST /upload/init     → returns sessionId + chunkSize
+//   2. POST /upload/chunk    → sends each chunk (< plan limit)
+//   3. POST /upload/complete → finalizes multipart on all accounts
+//   4. POST /upload/abort    → cancels if error
+// ============================================================
+
+export async function handleChunkedInit(
+  req: Request,
+  env: Env
+): Promise<Response> {
+  cleanupSessions();
+
+  const body = await req.json() as {
+    filename: string;
+    fileSize: number;
+    contentType?: string;
+  };
+
+  if (!body.filename || !body.fileSize) {
+    return new Response(JSON.stringify({ error: "filename and fileSize required" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const accounts = getR2Accounts(env);
+  const ext = getExtension(body.filename, body.contentType);
+  const uniqueName = generateUniqueFilename(ext);
+  const mime = body.contentType || "application/octet-stream";
+  const sessionId = generateSessionId();
+
+  console.log(`Chunked init: ${body.filename} → ${uniqueName} (${(body.fileSize / 1024 / 1024).toFixed(1)} MB)`);
+
+  // If file is small enough for simple PUT, we don't need multipart
+  if (body.fileSize <= MULTIPART_THRESHOLD) {
+    const session: UploadSession = {
+      objectKey: uniqueName,
+      contentType: mime,
+      accounts: accounts.map((acc) => ({
+        account: acc,
+        uploadId: "", // No multipart needed
+        parts: [],
+        nextPartNumber: 1,
+      })),
+      totalSize: body.fileSize,
+      uploadedSize: 0,
+      createdAt: Date.now(),
+    };
+    uploadSessions.set(sessionId, session);
+
+    return new Response(
+      JSON.stringify({
+        sessionId,
+        objectKey: uniqueName,
+        chunkSize: body.fileSize, // Send entire file in one chunk
+        totalChunks: 1,
+        mode: "simple",
+      }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Initiate multipart on all accounts sequentially
+  const accountSessions: UploadSession["accounts"] = [];
+
+  for (const account of accounts) {
+    try {
+      const uploadId = await initiateMultipart(account, uniqueName, mime);
+      console.log(`[${account.label}] Multipart initiated: ${uploadId.substring(0, 16)}...`);
+      accountSessions.push({
+        account,
+        uploadId,
+        parts: [],
+        nextPartNumber: 1,
+      });
+    } catch (err) {
+      console.error(`[${account.label}] Failed to init multipart: ${(err as Error).message}`);
+      // Abort already-initiated uploads
+      for (const as of accountSessions) {
+        await abortMultipart(as.account, uniqueName, as.uploadId);
+      }
+      return new Response(
+        JSON.stringify({ error: `Failed to initialize upload on ${account.label}` }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+  }
+
+  const session: UploadSession = {
+    objectKey: uniqueName,
+    contentType: mime,
+    accounts: accountSessions,
+    totalSize: body.fileSize,
+    uploadedSize: 0,
+    createdAt: Date.now(),
+  };
+  uploadSessions.set(sessionId, session);
+
+  const totalChunks = Math.ceil(body.fileSize / CHUNK_SIZE);
+
+  return new Response(
+    JSON.stringify({
+      sessionId,
+      objectKey: uniqueName,
+      chunkSize: CHUNK_SIZE,
+      totalChunks,
+      mode: "multipart",
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
+export async function handleChunkedUpload(
+  req: Request,
+  env: Env
+): Promise<Response> {
+  const url = new URL(req.url);
+  const sessionId = url.searchParams.get("sessionId");
+  const chunkIndex = parseInt(url.searchParams.get("chunkIndex") || "0", 10);
+
+  if (!sessionId) {
+    return new Response(JSON.stringify({ error: "sessionId required" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const session = uploadSessions.get(sessionId);
+  if (!session) {
+    return new Response(JSON.stringify({ error: "Session not found or expired" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // Read the chunk data from request body
+  const chunkData = new Uint8Array(await req.arrayBuffer());
+  console.log(`Chunk ${chunkIndex} received: ${(chunkData.byteLength / 1024 / 1024).toFixed(1)} MB`);
+
+  // Simple mode: small file, just buffer and upload on complete
+  if (session.accounts[0].uploadId === "") {
+    // For simple mode, store the data and upload on complete
+    // Since it's small (< 5MB), just upload immediately to all accounts
+    const errors: string[] = [];
+    const successes: string[] = [];
+
+    for (const accSession of session.accounts) {
+      try {
+        await uploadSimplePut(accSession.account, session.objectKey, chunkData, session.contentType);
+        successes.push(accSession.account.label);
+      } catch (err) {
+        errors.push(`${accSession.account.label}: ${(err as Error).message}`);
+      }
+    }
+
+    uploadSessions.delete(sessionId);
+
+    if (successes.length === 0) {
+      return new Response(
+        JSON.stringify({ error: `All uploads failed: ${errors.join("; ")}` }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    return new Response(
+      JSON.stringify({
+        done: true,
+        filename: session.objectKey,
+        size: chunkData.byteLength,
+        links: buildDownloadLinks(session.objectKey, session.accounts.map((a) => a.account)),
+        uploadedTo: successes,
+      }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Multipart mode: split chunk into PART_SIZE pieces and upload to all accounts
+  let offset = 0;
+  while (offset < chunkData.byteLength) {
+    const end = Math.min(offset + PART_SIZE, chunkData.byteLength);
+    const partData = chunkData.subarray(offset, end);
+
+    // Upload this part to all accounts sequentially
+    for (const accSession of session.accounts) {
+      const partNum = accSession.nextPartNumber;
+      try {
+        const etag = await uploadPart(
+          accSession.account,
+          session.objectKey,
+          accSession.uploadId,
+          partNum,
+          partData
+        );
+        accSession.parts.push({ partNumber: partNum, etag });
+        accSession.nextPartNumber++;
+        console.log(
+          `[${accSession.account.label}] Part ${partNum} uploaded (${(partData.byteLength / 1024 / 1024).toFixed(1)} MB)`
+        );
+      } catch (err) {
+        console.error(
+          `[${accSession.account.label}] Part ${partNum} failed: ${(err as Error).message}`
+        );
+        // Don't abort the whole session — other accounts might succeed
+        // Mark this account as failed by setting uploadId to empty
+        await abortMultipart(accSession.account, session.objectKey, accSession.uploadId);
+        accSession.uploadId = "FAILED";
+      }
+
+      await delay(INTER_PART_DELAY_MS);
+    }
+
+    offset = end;
+    session.uploadedSize += partData.byteLength;
+  }
+
+  const percent = session.totalSize > 0
+    ? Math.min(99, Math.round((session.uploadedSize / session.totalSize) * 100))
+    : 0;
+
+  return new Response(
+    JSON.stringify({
+      done: false,
+      chunkIndex,
+      uploadedSize: session.uploadedSize,
+      totalSize: session.totalSize,
+      percent,
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
+export async function handleChunkedComplete(
+  req: Request,
+  env: Env
+): Promise<Response> {
+  const body = await req.json() as { sessionId: string };
+
+  if (!body.sessionId) {
+    return new Response(JSON.stringify({ error: "sessionId required" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const session = uploadSessions.get(body.sessionId);
+  if (!session) {
+    return new Response(JSON.stringify({ error: "Session not found or expired" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const successes: string[] = [];
+  const errors: string[] = [];
+
+  for (const accSession of session.accounts) {
+    if (accSession.uploadId === "FAILED" || accSession.uploadId === "") {
+      errors.push(`${accSession.account.label}: previously failed`);
+      continue;
+    }
+
+    if (accSession.parts.length === 0) {
+      errors.push(`${accSession.account.label}: no parts uploaded`);
+      await abortMultipart(accSession.account, session.objectKey, accSession.uploadId);
+      continue;
+    }
+
+    try {
+      await completeMultipart(
+        accSession.account,
+        session.objectKey,
+        accSession.uploadId,
+        accSession.parts
+      );
+      console.log(`[${accSession.account.label}] Multipart complete (${accSession.parts.length} parts)`);
+      successes.push(accSession.account.label);
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      console.error(`[${accSession.account.label}] Complete failed: ${msg}`);
+      errors.push(`${accSession.account.label}: ${msg}`);
+      await abortMultipart(accSession.account, session.objectKey, accSession.uploadId);
+    }
+  }
+
+  uploadSessions.delete(body.sessionId);
+
+  if (successes.length === 0) {
+    return new Response(
+      JSON.stringify({ error: `All uploads failed: ${errors.join("; ")}` }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  return new Response(
+    JSON.stringify({
+      done: true,
+      filename: session.objectKey,
+      size: session.uploadedSize,
+      links: buildDownloadLinks(session.objectKey, session.accounts.map((a) => a.account)),
+      uploadedTo: successes,
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
+export async function handleChunkedAbort(
+  req: Request,
+  env: Env
+): Promise<Response> {
+  const body = await req.json() as { sessionId: string };
+
+  if (!body.sessionId) {
+    return new Response(JSON.stringify({ error: "sessionId required" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const session = uploadSessions.get(body.sessionId);
+  if (session) {
+    for (const accSession of session.accounts) {
+      if (accSession.uploadId && accSession.uploadId !== "FAILED") {
+        await abortMultipart(accSession.account, session.objectKey, accSession.uploadId);
+      }
+    }
+    uploadSessions.delete(body.sessionId);
+  }
+
+  return new Response(
+    JSON.stringify({ aborted: true }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
+// ============ Handle Direct File Upload (small files only) ============
+// For files under the Cloudflare plan limit
 
 export async function handleUpload(
   req: Request,
@@ -763,55 +1128,14 @@ export async function handleUpload(
     `File upload: ${file.name} → ${uniqueName} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`
   );
 
-  // ★ For files under MULTIPART_THRESHOLD, buffer is fine (small)
-  if (fileSize <= MULTIPART_THRESHOLD) {
-    const buffer = new Uint8Array(await file.arrayBuffer());
-
-    const successes: string[] = [];
-    const errors: string[] = [];
-
-    // Sequential uploads for small files
-    for (const account of accounts) {
-      try {
-        await uploadSimplePut(account, uniqueName, buffer, mime);
-        console.log(`[${account.label}] Done`);
-        successes.push(account.label);
-      } catch (err) {
-        const msg = (err as Error).message || String(err);
-        console.error(`[${account.label}] Failed: ${msg}`);
-        errors.push(`${account.label}: ${msg}`);
-      }
-    }
-
-    if (successes.length === 0) {
-      throw new Error(`All R2 uploads failed: ${errors.join("; ")}`);
-    }
-
-    return {
-      filename: uniqueName,
-      size: buffer.byteLength,
-      links: buildDownloadLinks(uniqueName, accounts),
-      uploadedTo: successes,
-    };
-  }
-
-  // ★ LARGE FILE: Stream-read from file, upload part-by-part to each account SEQUENTIALLY
-  // We read the file into part-sized chunks and store them temporarily,
-  // then upload to each account one at a time.
-  // Max memory: ~10MB (one part at a time per account) + part ETags storage
-
-  // Strategy: Read file stream → upload parts to Account-1 → re-read → upload parts to Account-2
-  // Since File objects support .stream() which can be called multiple times,
-  // we can stream to each account separately.
-
   const successes: string[] = [];
   const errors: string[] = [];
 
+  // Upload to each account sequentially using streaming
   for (const account of accounts) {
     try {
-      console.log(`[${account.label}] Starting streaming multipart upload (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+      console.log(`[${account.label}] Starting upload (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
 
-      // Get a fresh stream for each account
       const fileStream = file.stream() as ReadableStream<Uint8Array>;
 
       await streamRequestToOneAccount(
@@ -822,7 +1146,7 @@ export async function handleUpload(
         fileSize,
         (partNum, uploaded) => {
           console.log(
-            `[${account.label}] Progress: part ${partNum}, ${(uploaded / 1024 / 1024).toFixed(1)} MB uploaded`
+            `[${account.label}] Part ${partNum}, ${(uploaded / 1024 / 1024).toFixed(1)} MB done`
           );
         }
       );
@@ -835,7 +1159,6 @@ export async function handleUpload(
       errors.push(`${account.label}: ${msg}`);
     }
 
-    // Small delay between accounts
     if (successes.length < accounts.length) {
       await delay(INTER_ACCOUNT_DELAY_MS);
     }
@@ -854,13 +1177,7 @@ export async function handleUpload(
 }
 
 // ============================================================
-// Handle Remote URL Upload
-// ★ CHANGED: SEQUENTIAL — Upload to accounts one at a time
-// Each account gets its OWN fresh download stream
-// This avoids double-bandwidth and connection contention
-//
-// Per account: max 2 connections (1 download + 1 part upload)
-// Memory: ~10MB (1 part buffer)
+// Handle Remote URL Upload — SEQUENTIAL per account
 // ============================================================
 
 export async function handleRemoteUpload(
@@ -1002,7 +1319,7 @@ export async function handleRemoteUpload(
     };
   }
 
-  // ========== LARGE FILE: upload to accounts SEQUENTIALLY, each with own download ==========
+  // ========== LARGE FILE: upload to accounts SEQUENTIALLY ==========
 
   console.log(`\nLarge file — uploading to ${accounts.length} accounts SEQUENTIALLY`);
 
@@ -1026,7 +1343,6 @@ export async function handleRemoteUpload(
         contentLength,
         onProgress
           ? (info) => {
-              // Calculate progress: each account gets an equal portion of the progress bar
               const accountBasePercent = Math.round((i / accounts.length) * 100);
               const accountSharePercent = Math.round(100 / accounts.length);
               const accountProgress = Math.round(
@@ -1059,7 +1375,6 @@ export async function handleRemoteUpload(
       errors.push(`${account.label}: ${msg}`);
     }
 
-    // Delay between accounts to let connections fully close
     if (i < accounts.length - 1) {
       console.log(`Waiting ${INTER_ACCOUNT_DELAY_MS}ms before next account...`);
       await delay(INTER_ACCOUNT_DELAY_MS);
