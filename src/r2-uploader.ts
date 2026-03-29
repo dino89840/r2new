@@ -21,11 +21,11 @@ export interface Env {
 const DOWNLOAD_LINKS_MAP: Record<string, string[]> = {
   "Account-1": [
     "https://kajarling.kajarling.ooguy.com/download",
-    "https://pub-9c8bcd6f32434fe08628852555cc2e5c.r2.dev",
+    "https://lugyiapplication.nanmoelay.ooguy.com/download",
   ],
   "Account-2": [
     "https://lugyiappreel.carton-lugyiapp.gleeze.com/download",
-    "https://pub-cbf23f7a9f914d1a88f8f1cf741716db.r2.dev",
+    "https://lugi.samalay.ooguy.com/download",
   ],
 };
 
